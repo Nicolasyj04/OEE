@@ -1,0 +1,6 @@
+C:\Users\USER\Documents\SharpDevelop Projects\OEE\OEE\obj\Debug\OEE.csprojResolveAssemblyReference.cache
+C:\Users\USER\Documents\SharpDevelop Projects\OEE\OEE\bin\Debug\OEE.exe.config
+C:\Users\USER\Documents\SharpDevelop Projects\OEE\OEE\bin\Debug\OEE.exe
+C:\Users\USER\Documents\SharpDevelop Projects\OEE\OEE\bin\Debug\OEE.pdb
+C:\Users\USER\Documents\SharpDevelop Projects\OEE\OEE\obj\Debug\OEE.exe
+C:\Users\USER\Documents\SharpDevelop Projects\OEE\OEE\obj\Debug\OEE.pdb
