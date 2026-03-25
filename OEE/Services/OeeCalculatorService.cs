@@ -200,7 +200,7 @@ namespace OEE.Services
 		        // 根据产线类型区分查询逻辑
 		        if (line.ProductLineTypeNo == "ZP")
 		        {
-		            // 核心修正点：使用 OUTER APPLY 关联标签打印表，逆向推导产品品名
+		            // 装配线 (ZP) 逻辑保持不变：使用 OUTER APPLY 逆向推导产品品名
 		            sql = @"
 		                SELECT 
 		                    off.occur_date,
@@ -208,7 +208,7 @@ namespace OEE.Services
 		                    ISNULL(lbl.product_no, '') AS product_no
 		                FROM tx02_assm_offline_record off
 		                
-		                -- 核心理论：时间序列的就近匹配
+		                -- 时间序列的就近匹配
 		                OUTER APPLY (
 		                    SELECT TOP 1 p.product_no 
 		                    FROM T200_customer_label_print p 
@@ -223,16 +223,16 @@ namespace OEE.Services
 		        }
 		        else 
 		        {
-		            // 机加工线 (JJG) 或其他自带品名的报工表查询逻辑
+		            // 修复点：非装配线统一使用最后一道工序的扫码视图
 		            sql = @"
 		                SELECT 
-		                    occur_date,
-		                    delivery_num,
+		                    edit_time AS occur_date,
+		                    1.0 AS delivery_num, 
 		                    ISNULL(product_no, '') AS product_no
-		                FROM tx02_jjg_offline_record -- 请确认此处为实际的机加工下线表名
+		                FROM Vx02_scan_record_last_op
 		                WHERE product_line_no = @LineNo
-		                  AND occur_date >= @StartTime
-		                  AND occur_date < @EndTime";
+		                  AND edit_time >= @StartTime
+		                  AND edit_time < @EndTime";
 		        }
 		
 		        using (SqlCommand cmd = new SqlCommand(sql, conn))
@@ -250,7 +250,8 @@ namespace OEE.Services
 		                    records.Add(new ScanRecord
 		                    {
 		                        OccurDate = Convert.ToDateTime(reader["occur_date"]),
-		                        DeliveryNum = Convert.ToInt32(reader["delivery_num"]),
+		                        // 使用 ToDouble 兼容视图中常量 1.0 的浮点数转化
+		                        DeliveryNum = Convert.ToDouble(reader["delivery_num"]), 
 		                        ProductNo = reader["product_no"].ToString()
 		                    });
 		                }
@@ -316,15 +317,14 @@ namespace OEE.Services
             return planStop < 0 ? 0 : planStop;
         }
 
-        private double GetAbnormalStopTime(ProductLineOee line, out double jgPlanStopTime)
+       private double GetAbnormalStopTime(ProductLineOee line, out double jgPlanStopTime)
 		{
 		    double abnormalStop = 0;
 		    jgPlanStopTime = 0;
 		
 		    using (SqlConnection conn = new SqlConnection(_mainDbConn))
 		    {
-		        // 核心修改：使用 OUTER APPLY 分别获取装配(ZP)和机加工(JJG)的最新报表状态
-		        // 并使用 ISNULL 层层兜底，确保 halt_type 取值正确
+		        // 核心修改：在 WHERE 子句中补齐了 start_time >= @Start 的时间轴边界约束
 		        string sql = @"
 		            SELECT 
 		                SUM(plhr.diff_time) as total_diff, 
@@ -353,10 +353,12 @@ namespace OEE.Services
 		              AND plhr.end_time <= @LastOffline
 		              AND plhr.end_time >= @Start 
 		              AND plhr.end_time < @End
+		              AND plhr.start_time >= @Start -- 【修复点】：补齐异常开始时间的边界限制
 		            GROUP BY ISNULL(har.halt_type, ISNULL(harjjg.halt_type, '异常停机'))";
 		
 		        using (SqlCommand cmd = new SqlCommand(sql, conn))
 		        {
+		            // 绑定基础坐标与时间轴参数
 		            cmd.Parameters.AddWithValue("@LineNo", line.ProductLineNo);
 		            cmd.Parameters.AddWithValue("@LastOffline", line.LastOfflineTime);
 		            cmd.Parameters.AddWithValue("@Start", line.ShiftStartTime);
@@ -367,7 +369,6 @@ namespace OEE.Services
 		            {
 		                while (reader.Read())
 		                {
-		                    // 使用新的聚合别名 final_halt_type 取值
 		                    string haltType = reader["final_halt_type"].ToString();
 		                    double diffMinutes = reader["total_diff"] == DBNull.Value ? 0 : Convert.ToDouble(reader["total_diff"]);
 		                    
@@ -388,7 +389,6 @@ namespace OEE.Services
 		    }
 		    return abnormalStop;
 		}
-
         private double GetTheoreticalCt(ProductLineOee line)
         {
             string safeProductNo = string.IsNullOrEmpty(line.ProductNo) ? "" : line.ProductNo;
@@ -409,30 +409,37 @@ namespace OEE.Services
         }
 
         private double GetScrapQuantity(ProductLineOee line)
-        {
-            using (SqlConnection conn = new SqlConnection(_mainDbConn))
-            {
-                string sql = @"
-                    SELECT SUM(CASE WHEN mnd.scrap_num > 0 THEN mnd.scrap_num ELSE mnd.consign_num END) as total_scrap
-                    FROM T209_move_notify_detail mnd
-                    INNER JOIN T209_move_notify_master mnm ON mnd.notify_no = mnm.notify_no
-                    WHERE mnd.product_line_no = @LineNo
-                    AND mnd.notify_type = 'unqualify_record'
-                    AND mnd.abnormal_type_cn IN ('车间废','工厂废')
-                    AND mnm.edit_date >= @Start AND mnm.edit_date < @End
-                    AND mnm.abnormal_reason NOT LIKE '%金相切割%'";
-
-                using (SqlCommand cmd = new SqlCommand(sql, conn))
-                {
-                    cmd.Parameters.AddWithValue("@LineNo", line.ProductLineNo);
-                    cmd.Parameters.AddWithValue("@Start", line.ShiftStartTime);
-                    cmd.Parameters.AddWithValue("@End", line.ShiftEndTime);
-                    conn.Open();
-                    object result = cmd.ExecuteScalar();
-                    return result == DBNull.Value || result == null ? 0 : Convert.ToDouble(result);
-                }
-            }
-        }
+		{
+		    using (SqlConnection conn = new SqlConnection(_mainDbConn))
+		    {
+		        // 核心修改：在 WHERE 子句末尾补充了针对装配线(ZP)和异常来源的联合判断
+		        string sql = @"
+		            SELECT SUM(CASE WHEN mnd.scrap_num > 0 THEN mnd.scrap_num ELSE mnd.consign_num END) as total_scrap
+		            FROM T209_move_notify_detail mnd
+		            INNER JOIN T209_move_notify_master mnm ON mnd.notify_no = mnm.notify_no
+		            WHERE mnd.product_line_no = @LineNo
+		            AND mnd.notify_type = 'unqualify_record'
+		            AND mnd.abnormal_type_cn IN ('车间废','工厂废')
+		            AND mnm.edit_date >= @Start AND mnm.edit_date < @End
+		            AND mnm.abnormal_reason NOT LIKE '%金相切割%'
+		            AND (@LineType <> 'ZP' OR (@LineType = 'ZP' AND mnd.source_type <> 'pb_lf_abnormal'))";
+		
+		        using (SqlCommand cmd = new SqlCommand(sql, conn))
+		        {
+		            // 绑定基础坐标与时间轴参数
+		            cmd.Parameters.AddWithValue("@LineNo", line.ProductLineNo);
+		            cmd.Parameters.AddWithValue("@Start", line.ShiftStartTime);
+		            cmd.Parameters.AddWithValue("@End", line.ShiftEndTime);
+		            
+		            // 绑定新增的产线类型参数，做防御性处理防止空引用
+		            cmd.Parameters.AddWithValue("@LineType", string.IsNullOrEmpty(line.ProductLineTypeNo) ? "" : line.ProductLineTypeNo);
+		
+		            conn.Open();
+		            object result = cmd.ExecuteScalar();
+		            return result == DBNull.Value || result == null ? 0 : Convert.ToDouble(result);
+		        }
+		    }
+		}
 
        /// <summary>
 /// 将 OEE 计算结果及所有相关的明细数据（异常、扫码区间）持久化到数据库
