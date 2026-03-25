@@ -197,33 +197,27 @@ namespace OEE.Services
 		    {
 		        string sql = "";
 		
-		        // 根据产线类型区分查询逻辑
 		        if (line.ProductLineTypeNo == "ZP")
 		        {
-		            // 装配线 (ZP) 逻辑保持不变：使用 OUTER APPLY 逆向推导产品品名
+		            // 【修复点】：放弃模糊的时间序列推导，恢复原版 SQL 基于 label_guid 的精准追溯
 		            sql = @"
 		                SELECT 
-		                    off.occur_date,
-		                    off.delivery_num,
-		                    ISNULL(lbl.product_no, '') AS product_no
+		                    off.offline_time AS occur_date,
+		                    1.0 AS delivery_num,
+		                    ISNULL(cld.product_no, '') AS product_no
 		                FROM tx02_assm_offline_record off
 		                
-		                -- 时间序列的就近匹配
-		                OUTER APPLY (
-		                    SELECT TOP 1 p.product_no 
-		                    FROM T200_customer_label_print p 
-		                    WHERE p.product_line_no = off.product_line_no 
-		                      AND p.print_date <= off.occur_date
-		                    ORDER BY p.print_date DESC
-		                ) lbl
+		                -- 通过全局唯一标识符(GUID)建立确定性的物理表关联
+		                LEFT JOIN T200_customer_label_print clp ON clp.label_guid = off.label_guid
+		                LEFT JOIN T200_customer_label_detail cld ON cld.detail_guid = clp.detail_guid
 		                
 		                WHERE off.product_line_no = @LineNo
-		                  AND off.occur_date >= @StartTime
-		                  AND off.occur_date < @EndTime";
+		                  AND off.offline_time >= @StartTime
+		                  AND off.offline_time < @EndTime";
 		        }
 		        else 
 		        {
-		            // 修复点：非装配线统一使用最后一道工序的扫码视图
+		            // 非装配线统一使用最后一道工序的扫码视图
 		            sql = @"
 		                SELECT 
 		                    edit_time AS occur_date,
@@ -237,7 +231,7 @@ namespace OEE.Services
 		
 		        using (SqlCommand cmd = new SqlCommand(sql, conn))
 		        {
-		            // 参数绑定，防止 SQL 注入
+		            // 参数绑定，防止 SQL 注入并界定时间轴
 		            cmd.Parameters.AddWithValue("@LineNo", line.ProductLineNo);
 		            cmd.Parameters.AddWithValue("@StartTime", line.ShiftStartTime);
 		            cmd.Parameters.AddWithValue("@EndTime", line.ShiftEndTime);
@@ -250,7 +244,6 @@ namespace OEE.Services
 		                    records.Add(new ScanRecord
 		                    {
 		                        OccurDate = Convert.ToDateTime(reader["occur_date"]),
-		                        // 使用 ToDouble 兼容视图中常量 1.0 的浮点数转化
 		                        DeliveryNum = Convert.ToDouble(reader["delivery_num"]), 
 		                        ProductNo = reader["product_no"].ToString()
 		                    });
@@ -260,33 +253,67 @@ namespace OEE.Services
 		    }
 		    return records;
 		}
-        private double GetRestTime(ProductLineOee line)
-        {
-            double rest = 0;
-            using (SqlConnection conn = new SqlConnection(_mainDbConn))
-            {
-                // 提取原存储过程中对于休息时间的计算部分
-                string sql = @"
-                    SELECT SUM(round(DATEDIFF(second, start_time, 
-                        CASE WHEN end_time > @LastOffline THEN @LastOffline ELSE end_time END) / 3600.0, 2)) as rest_time
-                    FROM TA05_product_line_shift_rest
-                    WHERE product_line_no = @LineNo 
-                    AND start_time < @LastOffline";
-
-                using (SqlCommand cmd = new SqlCommand(sql, conn))
-                {
-                    cmd.Parameters.AddWithValue("@LineNo", line.ProductLineNo);
-                    cmd.Parameters.AddWithValue("@LastOffline", line.LastOfflineTime);
-                    conn.Open();
-                    object result = cmd.ExecuteScalar();
-                    if (result != DBNull.Value && result != null)
-                    {
-                        rest = Convert.ToDouble(result);
-                    }
-                }
-            }
-            return rest < 0 ? 0 : rest; // 防御性编程：防止负数时间污染计算结果
-        }
+       private double GetRestTime(ProductLineOee line)
+		{
+		    double totalRestHours = 0;
+		    using (SqlConnection conn = new SqlConnection(_mainDbConn))
+		    {
+		        // 提取数据库中该产线的静态作息时间配置，包含关键的跨天标记（Tomorrow Tag）
+		        string sql = @"
+		            SELECT start_time, end_time, start_tomorrow_tag, end_tomorrow_tag
+		            FROM TA05_product_line_shift_rest
+		            WHERE product_line_no = @LineNo";
+		
+		        using (SqlCommand cmd = new SqlCommand(sql, conn))
+		        {
+		            cmd.Parameters.AddWithValue("@LineNo", line.ProductLineNo);
+		            conn.Open();
+		            using (SqlDataReader reader = cmd.ExecuteReader())
+		            {
+		                while (reader.Read())
+		                {
+		                    // 1. 提取静态基准时间（此时日期部分如 1900-01-01 是无效的）
+		                    DateTime baseStart = Convert.ToDateTime(reader["start_time"]);
+		                    DateTime baseEnd = Convert.ToDateTime(reader["end_time"]);
+		                    
+		                    // 获取配置表中的跨天标识参数
+		                    string startTomorrowTag = reader["start_tomorrow_tag"].ToString();
+		                    string endTomorrowTag = reader["end_tomorrow_tag"].ToString();
+		
+		                    // 2. 核心转换：将静态的时分秒（TimeOfDay）“锚定”到当前班次的真实发生日期（ShiftStartDate）上
+		                    DateTime actualStart = line.ShiftStartDate.Date.Add(baseStart.TimeOfDay);
+		                    DateTime actualEnd = line.ShiftStartDate.Date.Add(baseEnd.TimeOfDay);
+		
+		                    // 3. 跨夜班时间轴重组（Tomorrow Tag 逻辑补偿）
+		                    if (startTomorrowTag == "T")
+		                    {
+		                        actualStart = actualStart.AddDays(1);
+		                    }
+		                    
+		                    // 业务规则：如果开始时间跨天，或者单独标记了结束时间跨天，结束的绝对时间都需要加一天
+		                    if (startTomorrowTag == "T" || endTomorrowTag == "T")
+		                    {
+		                        actualEnd = actualEnd.AddDays(1);
+		                    }
+		
+		                    // 4. 动态水位线截断（High Watermark 理论）
+		                    if (actualEnd > line.LastOfflineTime)
+		                    {
+		                        actualEnd = line.LastOfflineTime;
+		                    }
+		
+		                    // 5. 最终有效性验证
+		                    if (actualStart < actualEnd)
+		                    {
+		                        // 累加实际发生的休息时间（秒转小时）
+		                        totalRestHours += (actualEnd - actualStart).TotalSeconds / 3600.0;
+		                    }
+		                }
+		            }
+		        }
+		    }
+		    return Math.Round(totalRestHours, 2);
+		}
 
         private double GetPlanStopTime(ProductLineOee line)
         {
@@ -317,7 +344,7 @@ namespace OEE.Services
             return planStop < 0 ? 0 : planStop;
         }
 
-       private double GetAbnormalStopTime(ProductLineOee line, out double jgPlanStopTime)
+        private double GetAbnormalStopTime(ProductLineOee line, out double jgPlanStopTime)
 		{
 		    double abnormalStop = 0;
 		    jgPlanStopTime = 0;
@@ -447,6 +474,12 @@ namespace OEE.Services
 /// <param name="lines">已完成 OEE 内存计算的产线集合</param>
 /// <param name="date">目标计算日期</param>
 /// <param name="lineScanMap">产线与其对应的扫码记录字典，用于生成区间汇总表</param>
+		/// <summary>
+/// 将 OEE 计算结果及所有相关的明细数据（异常、扫码区间）持久化到数据库
+/// </summary>
+/// <param name="lines">已完成 OEE 内存计算的产线集合</param>
+/// <param name="date">目标计算日期</param>
+/// <param name="lineScanMap">产线与其对应的扫码记录字典，用于生成区间汇总表</param>
 		private void SaveOeeResultsToDatabase(List<ProductLineOee> lines, DateTime date, Dictionary<ProductLineOee, List<ScanRecord>> lineScanMap)
 		{
 		    using (SqlConnection conn = new SqlConnection(_mainDbConn))
@@ -457,38 +490,6 @@ namespace OEE.Services
 		        {
 		            try
 		            {
-		                // ========================================================
-		                // 阶段一：数据幂等性清理（防止重复计算导致数据翻倍）
-		                // ========================================================
-		                
-		                // 1. 清理主结果表的老旧数据
-		                string delSql = "DELETE FROM TA07_shop_oee_calc_result WHERE start_date = @Date";
-		                using (SqlCommand delCmd = new SqlCommand(delSql, conn, trans))
-		                {
-		                    delCmd.Parameters.AddWithValue("@Date", date.Date);
-		                    delCmd.ExecuteNonQuery();
-		                }
-		
-		                // 2. 清理异常明细表的历史数据
-		                string delAbnormalSql = "DELETE FROM TA07_shop_oee_calc_abnormal WHERE input_date = @Date";
-		                using (SqlCommand delAbCmd = new SqlCommand(delAbnormalSql, conn, trans))
-		                {
-		                    delAbCmd.Parameters.AddWithValue("@Date", date.Date);
-		                    delAbCmd.ExecuteNonQuery();
-		                }
-		
-		                // 3. 清理扫码计件区间表的历史数据
-		                string delScanSql = "DELETE FROM TA07_shop_oee_calc_scan WHERE start_date = @Date";
-		                using (SqlCommand delScanCmd = new SqlCommand(delScanSql, conn, trans))
-		                {
-		                    delScanCmd.Parameters.AddWithValue("@Date", date.Date);
-		                    delScanCmd.ExecuteNonQuery();
-		                }
-		
-		                // ========================================================
-		                // 阶段二：遍历产线，将最新快照与明细写入各表
-		                // ========================================================
-		                
 		                // 预定义主表的 Insert SQL，提升代码可读性
 		                string insResultSql = @"INSERT INTO TA07_shop_oee_calc_result 
 		                    (sys_no, product_line_no, start_date, start_time, end_time, total_time, rest,
@@ -503,6 +504,42 @@ namespace OEE.Services
 		
 		                foreach (var line in lines)
 		                {
+		                    // ========================================================
+		                    // 阶段一：数据幂等性清理（【修复】：将清理逻辑移入循环，限定产线范围）
+		                    // ========================================================
+		                    
+		                    // 1. 清理当前产线在主结果表的老旧数据
+		                    string delSql = "DELETE FROM TA07_shop_oee_calc_result WHERE product_line_no = @LineNo AND start_date = @StartDate";
+		                    using (SqlCommand delCmd = new SqlCommand(delSql, conn, trans))
+		                    {
+		                        delCmd.Parameters.AddWithValue("@LineNo", line.ProductLineNo ?? string.Empty);
+		                        // 使用当前产线的班次归属日期，而不是全局传入的 Date
+		                        delCmd.Parameters.AddWithValue("@StartDate", line.ShiftStartDate); 
+		                        delCmd.ExecuteNonQuery();
+		                    }
+		
+		                    // 2. 清理当前产线在异常明细表的历史数据
+		                    string delAbnormalSql = "DELETE FROM TA07_shop_oee_calc_abnormal WHERE product_line_no = @LineNo AND input_date = @StartDate";
+		                    using (SqlCommand delAbCmd = new SqlCommand(delAbnormalSql, conn, trans))
+		                    {
+		                        delAbCmd.Parameters.AddWithValue("@LineNo", line.ProductLineNo ?? string.Empty);
+		                        delAbCmd.Parameters.AddWithValue("@StartDate", line.ShiftStartDate);
+		                        delAbCmd.ExecuteNonQuery();
+		                    }
+		
+		                    // 3. 清理当前产线在扫码计件区间表的历史数据
+		                    string delScanSql = "DELETE FROM TA07_shop_oee_calc_scan WHERE product_line_no = @LineNo AND start_date = @StartDate";
+		                    using (SqlCommand delScanCmd = new SqlCommand(delScanSql, conn, trans))
+		                    {
+		                        delScanCmd.Parameters.AddWithValue("@LineNo", line.ProductLineNo ?? string.Empty);
+		                        delScanCmd.Parameters.AddWithValue("@StartDate", line.ShiftStartDate);
+		                        delScanCmd.ExecuteNonQuery();
+		                    }
+		
+		                    // ========================================================
+		                    // 阶段二：写入各表最新快照与明细
+		                    // ========================================================
+		                    
 		                    // --------------------------------------------------------
 		                    // 2.1 写入 OEE 主表 (TA07_shop_oee_calc_result)
 		                    // --------------------------------------------------------
@@ -538,7 +575,7 @@ namespace OEE.Services
 		                    // 2.2 写入异常明细表 (TA07_shop_oee_calc_abnormal)
 		                    // --------------------------------------------------------
 		                    
-		                    // A. 从车间小时报表提取并转换异常记录（使用 OUTER APPLY 关联最新状态）
+		                    // A. 从车间小时报表提取并转换异常记录
 		                    string insAbnormalHourSql = @"
 		                        INSERT INTO TA07_shop_oee_calc_abnormal(
 		                            sys_no, abnormal_guid, input_date, qpr_no, qpr_sn, product_line_no, hour_name,
@@ -629,18 +666,13 @@ namespace OEE.Services
 		                    
 		                    if (lineScanMap.ContainsKey(line) && lineScanMap[line].Any())
 		                    {
-		                        // 核心操作：通过 LINQ 在内存中对时间戳进行“抹零归整”，划分为精确到小时的区间
 		                        var scanGroupSummary = lineScanMap[line]
 		                            .GroupBy(r => new DateTime(r.OccurDate.Year, r.OccurDate.Month, r.OccurDate.Day, r.OccurDate.Hour, 0, 0))
 		                            .Select(g => new
 		                            {
-		                                // 区间起点（例如：2025-02-10 08:00:00）
 		                                StartTime = g.Key,
-		                                // 区间终点（例如：2025-02-10 09:00:00）
 		                                EndTime = g.Key.AddHours(1),
-		                                // 预先格式化的区间名称（如："08:00~09:00"），减少前端图表渲染时的解析压力
 		                                ResultName = g.Key.ToString("HH:mm") + "~" + g.Key.AddHours(1).ToString("HH:mm"),
-		                                // 该时间窗口内的总下线产量
 		                                ResultNum = g.Sum(x => x.DeliveryNum)
 		                            }).ToList();
 		
@@ -657,7 +689,6 @@ namespace OEE.Services
 		                        {
 		                            using (SqlCommand cmdScan = new SqlCommand(insScanSql, conn, trans))
 		                            {
-		                                // NEWID() 由数据库隐式调用以生成绝对不冲突的 GUID 记录主键
 		                                cmdScan.Parameters.AddWithValue("@SysNo", line.SysNo ?? "");
 		                                cmdScan.Parameters.AddWithValue("@LineNo", line.ProductLineNo ?? "");
 		                                cmdScan.Parameters.AddWithValue("@StartDate", line.ShiftStartDate);
@@ -672,19 +703,16 @@ namespace OEE.Services
 		                    }
 		                } // 结束 foreach 循环
 		
-		                // 当主表、异常表、扫码表均无错误时，统一提交事务，数据正式落盘
 		                trans.Commit();
 		            }
 		            catch
 		            {
-		                // 一旦发生异常（例如断网或锁表），立刻回滚所有操作，避免出现“半个班次的数据”
 		                trans.Rollback();
 		                throw; 
 		            }
 		        }
 		    }
 		}
-    }
     // 内部协助类：用于承载数采库的扫码记录载体
     internal class ScanRecord
     {
